@@ -1,0 +1,205 @@
+name: 飞书签到通知
+
+on:
+  schedule:
+    # 每天北京时间 10:10 执行（签到 10:00 后 10 分钟）
+    - cron: '10 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  notify-feishu:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 查询最近一次签到结果并发送飞书通知
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "========== 排查信息 =========="
+          echo "1. FEISHU_WEBHOOK 是否配置: $([ -n "$FEISHU_WEBHOOK" ] && echo '是' || echo '否！！！')"
+          echo "2. FEISHU_SECRET 是否配置: $([ -n "$FEISHU_SECRET" ] && echo '是' || echo '否')"
+          echo "3. Webhook URL 前缀检查: $(echo "$FEISHU_WEBHOOK" | cut -c1-50)..."
+          echo "4. Webhook URL 长度: $(echo -n "$FEISHU_WEBHOOK" | wc -c) 字符"
+          echo "5. Webhook URL 末尾检查: ...$(echo "$FEISHU_WEBHOOK" | rev | cut -c1-20 | rev)"
+          echo ""
+
+          if [ -z "$FEISHU_WEBHOOK" ]; then
+            echo "❌ 错误：FEISHU_WEBHOOK Secret 未配置！"
+            echo "请去 Settings → Secrets → Actions → 添加 FEISHU_WEBHOOK"
+            exit 1
+          fi
+
+          # 检查 URL 格式
+          if ! echo "$FEISHU_WEBHOOK" | grep -q "open.feishu.cn/open-apis/bot/v2/hook/"; then
+            echo "❌ 错误：Webhook URL 格式不对！"
+            echo "正确格式：https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxx"
+            echo "你的 URL 开头是：$(echo "$FEISHU_WEBHOOK" | cut -c1-30)"
+            exit 1
+          fi
+
+          echo "========== 查询最近一次签到结果 =========="
+          # 调用 GitHub API 查询最近一次 workflow 运行
+          API_URL="https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=5"
+          echo "API: $API_URL"
+
+          RUNS=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL")
+
+          # 找最近一次非本 workflow 的运行
+          SIGNIN_CONCLUSION=""
+          SIGNIN_URL=""
+          SIGNIN_NAME=""
+
+          TOTAL=$(echo "$RUNS" | jq '.workflow_runs | length')
+          echo "共查到 $TOTAL 条运行记录"
+
+          for i in $(seq 0 $((TOTAL - 1))); do
+            NAME=$(echo "$RUNS" | jq -r ".workflow_runs[$i].name")
+            CONCLUSION=$(echo "$RUNS" | jq -r ".workflow_runs[$i].conclusion")
+            URL=$(echo "$RUNS" | jq -r ".workflow_runs[$i].html_url")
+            CREATED=$(echo "$RUNS" | jq -r ".workflow_runs[$i].created_at")
+
+            echo "  [$i] $NAME | $CONCLUSION | $CREATED"
+
+            # 找到签到 workflow（不是飞书通知本身）
+            if [ "$NAME" != "飞书签到通知" ] && [ -n "$CONCLUSION" ] && [ "$CONCLUSION" != "null" ]; then
+              SIGNIN_CONCLUSION="$CONCLUSION"
+              SIGNIN_URL="$URL"
+              SIGNIN_NAME="$NAME"
+              SIGNIN_CREATED="$CREATED"
+              break
+            fi
+          done
+
+          echo ""
+          echo "最近一次签到: $SIGNIN_NAME"
+          echo "结果: $SIGNIN_CONCLUSION"
+          echo "URL: $SIGNIN_URL"
+          echo ""
+
+          if [ -z "$SIGNIN_CONCLUSION" ]; then
+            echo "⚠️ 未找到已完成的签到记录，跳过通知"
+            exit 0
+          fi
+
+          # 状态判定
+          if [ "$SIGNIN_CONCLUSION" = "success" ]; then
+            TITLE="签到成功"
+            COLOR="green"
+            ICON="✅"
+            STATUS_TEXT="签到成功"
+          elif [ "$SIGNIN_CONCLUSION" = "failure" ]; then
+            TITLE="签到失败"
+            COLOR="red"
+            ICON="❌"
+            STATUS_TEXT="签到失败，请检查日志"
+          else
+            TITLE="签到状态异常"
+            COLOR="grey"
+            ICON="⏹️"
+            STATUS_TEXT="状态: $SIGNIN_CONCLUSION"
+          fi
+
+          # 北京时间
+          BJ_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
+
+          echo "========== 构造飞书消息 =========="
+          echo "标题: $ICON $TITLE"
+          echo "颜色: $COLOR"
+          echo "北京时间: $BJ_TIME"
+
+          # 构造卡片消息
+          CARD=$(cat <<JSONEOF
+          {
+            "msg_type": "interactive",
+            "card": {
+              "header": {
+                "title": { "tag": "plain_text", "content": "$ICON $TITLE" },
+                "template": "$COLOR"
+              },
+              "elements": [
+                {
+                  "tag": "div",
+                  "text": {
+                    "tag": "lark_md",
+                    "content": "**$ICON $TITLE**\n\n运行编号：签到任务\n运行状态：$STATUS_TEXT\n仓库：${{ github.repository }}\n北京时间：$BJ_TIME"
+                  }
+                },
+                {
+                  "tag": "action",
+                  "actions": [
+                    {
+                      "tag": "button",
+                      "text": { "tag": "plain_text", "content": "查看运行日志" },
+                      "url": "$SIGNIN_URL",
+                      "type": "primary"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+JSONEOF
+          )
+
+          echo "========== 发送飞书通知 =========="
+
+          # 签名校验（如果配置了 secret）
+          if [ -n "$FEISHU_SECRET" ]; then
+            echo "使用签名校验模式"
+            TIMESTAMP=$(date +%s)
+            STRING_TO_SIGN="$TIMESTAMP\n$FEISHU_SECRET"
+            SIGN=$(printf "$STRING_TO_SIGN" | openssl dgst -sha256 -hmac "$FEISHU_SECRET" -binary | base64)
+            WEBHOOK_URL="${FEISHU_WEBHOOK}&timestamp=${TIMESTAMP}&sign=${SIGN}"
+            echo "Timestamp: $TIMESTAMP"
+            echo "Sign: ${SIGN:0:20}..."
+          else
+            echo "未使用签名校验（直接发）"
+            WEBHOOK_URL="$FEISHU_WEBHOOK"
+          fi
+
+          echo ""
+          echo "完整 Webhook URL: $(echo "$WEBHOOK_URL" | cut -c1-60)..."
+          echo ""
+
+          # 发送
+          echo "正在发送请求..."
+          HTTP_CODE=$(curl -s -o /tmp/feishu_resp.txt -w "%{http_code}" -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$CARD")
+
+          RESPONSE=$(cat /tmp/feishu_resp.txt)
+
+          echo "========== 飞书返回结果 =========="
+          echo "HTTP 状态码: $HTTP_CODE"
+          echo "飞书返回内容: $RESPONSE"
+          echo ""
+
+          # 解析返回
+          CODE=$(echo "$RESPONSE" | jq -r '.code // "null"' 2>/dev/null)
+          MSG=$(echo "$RESPONSE" | jq -r '.msg // "null"' 2>/dev/null)
+
+          echo "解析 code: $CODE"
+          echo "解析 msg: $MSG"
+          echo ""
+
+          if [ "$CODE" = "0" ]; then
+            echo "✅ 飞书通知发送成功！请检查飞书群是否收到消息"
+          elif [ "$CODE" = "19021" ]; then
+            echo "❌ 签名校验失败！"
+            echo "原因：FEISHU_SECRET 和飞书机器人设置的签名密钥不一致"
+            echo "解决：去飞书群设置 → 群机器人 → 查看机器人配置的 secret → 更新 GitHub Secret"
+          elif [ "$CODE" = "9499" ]; then
+            echo "❌ Webhook 已失效！"
+            echo "原因：机器人被删除或 URL 错误"
+            echo "解决：重新创建飞书机器人，获取新的 Webhook URL"
+          elif [ "$CODE" = "19022" ]; then
+            echo "❌ IP 不在白名单！"
+            echo "原因：飞书机器人开了 IP 白名单，GitHub Actions 的 IP 不在里面"
+            echo "解决：关掉飞书机器人的 IP 白名单设置"
+          else
+            echo "⚠️ 未知返回码: $CODE"
+            echo "请把上面的「飞书返回内容」截图发给我"
+          fi
