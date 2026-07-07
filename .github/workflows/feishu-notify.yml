@@ -1,0 +1,130 @@
+name: 飞书签到通知
+
+on:
+  schedule:
+    - cron: '10 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 发送飞书通知
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$FEISHU_WEBHOOK" ]; then
+            echo "未配置 FEISHU_WEBHOOK"
+            exit 1
+          fi
+
+          echo "=== 查询最近一次签到结果 ==="
+          API_DATA=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/actions/runs?per_page=10")
+
+          SIGNIN_INFO=$(echo "$API_DATA" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          for r in d.get('workflow_runs',[]):
+            if r['name']!='飞书签到通知':
+              print(r['name'])
+              print(r.get('conclusion') or 'running')
+              print(r['html_url'])
+              break
+          ")
+
+          SIGNIN_NAME=$(echo "$SIGNIN_INFO" | sed -n '1p')
+          SIGNIN_STATUS=$(echo "$SIGNIN_INFO" | sed -n '2p')
+          SIGNIN_URL=$(echo "$SIGNIN_INFO" | sed -n '3p')
+
+          echo "签到: $SIGNIN_NAME | 状态: $SIGNIN_STATUS"
+
+          if [ -z "$SIGNIN_STATUS" ]; then
+            echo "未找到签到记录，跳过"
+            exit 0
+          fi
+
+          if [ "$SIGNIN_STATUS" = "success" ]; then
+            TITLE="签到成功"
+            COLOR="green"
+            ICON="✅"
+          elif [ "$SIGNIN_STATUS" = "failure" ]; then
+            TITLE="签到失败"
+            COLOR="red"
+            ICON="❌"
+          else
+            TITLE="签到异常"
+            COLOR="grey"
+            ICON="⚠️"
+          fi
+
+          BJ_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
+
+          echo "=== 构造飞书卡片 ==="
+
+          cat > /tmp/card.json << JSONEOF
+          {
+            "msg_type": "interactive",
+            "card": {
+              "header": {
+                "title": { "tag": "plain_text", "content": "$ICON $TITLE" },
+                "template": "$COLOR"
+              },
+              "elements": [
+                {
+                  "tag": "div",
+                  "text": {
+                    "tag": "lark_md",
+                    "content": "**$ICON $TITLE**\n仓库：$REPO\n时间：$BJ_TIME"
+                  }
+                },
+                {
+                  "tag": "action",
+                  "actions": [
+                    {
+                      "tag": "button",
+                      "text": { "tag": "plain_text", "content": "查看运行日志" },
+                      "url": "$SIGNIN_URL",
+                      "type": "primary"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+          JSONEOF
+
+          echo "卡片已构造完成"
+
+          if [ -n "$FEISHU_SECRET" ]; then
+            echo "使用签名校验"
+            TIMESTAMP=$(date +%s)
+            STRING_TO_SIGN="${TIMESTAMP}\n${FEISHU_SECRET}"
+            SIGN=$(printf "$STRING_TO_SIGN" | openssl dgst -sha256 -hmac "$FEISHU_SECRET" -binary | base64)
+            WEBHOOK_URL="${FEISHU_WEBHOOK}&timestamp=${TIMESTAMP}&sign=${SIGN}"
+          else
+            echo "无签名校验"
+            WEBHOOK_URL="$FEISHU_WEBHOOK"
+          fi
+
+          echo "=== 发送飞书通知 ==="
+          RESP=$(curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/card.json)
+
+          echo "飞书返回: $RESP"
+
+          if echo "$RESP" | grep -q '"code":0'; then
+            echo "✅ 发送成功"
+          elif echo "$RESP" | grep -q '19021'; then
+            echo "❌ 签名校验失败"
+          elif echo "$RESP" | grep -q '9499'; then
+            echo "❌ Webhook 失效"
+          elif echo "$RESP" | grep -q '19022'; then
+            echo "❌ IP 白名单拦截"
+          else
+            echo "⚠️ 未知返回"
+          fi
