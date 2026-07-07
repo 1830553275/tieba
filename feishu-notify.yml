@@ -1,0 +1,124 @@
+name: 飞书签到通知
+
+# 监听「百度贴吧自动签到」workflow 运行结束
+on:
+  workflow_run:
+    workflows: ["百度贴吧自动签到"]
+    types:
+      - completed
+
+jobs:
+  notify-feishu:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 发送飞书通知
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WORKFLOW_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          REPO_NAME: ${{ github.event.repository.full_name }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          EVENT: ${{ github.event.action }}
+        run: |
+          set -e
+
+          if [ -z "$FEISHU_WEBHOOK" ]; then
+            echo "未配置 FEISHU_WEBHOOK Secret，跳过通知"
+            exit 0
+          fi
+
+          # 状态判定
+          if [ "$WORKFLOW_CONCLUSION" = "success" ]; then
+            TITLE="贴吧签到成功"
+            COLOR="green"
+            ICON="✅"
+            STATUS_TEXT="签到成功"
+          elif [ "$WORKFLOW_CONCLUSION" = "failure" ]; then
+            TITLE="贴吧签到失败"
+            COLOR="red"
+            ICON="❌"
+            STATUS_TEXT="签到失败，请检查日志"
+          elif [ "$WORKFLOW_CONCLUSION" = "cancelled" ]; then
+            TITLE="贴吧签到已取消"
+            COLOR="grey"
+            ICON="⏹️"
+            STATUS_TEXT="运行被取消"
+          else
+            TITLE="贴吧签到状态异常"
+            COLOR="yellow"
+            ICON="⚠️"
+            STATUS_TEXT="状态: $WORKFLOW_CONCLUSION"
+          fi
+
+          # 北京时间（UTC+8）
+          BJ_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
+
+          # 构造卡片消息
+          CONTENT="**$ICON $TITLE**\n\n"
+          CONTENT+="运行编号：#$RUN_NUMBER\n"
+          CONTENT+="运行状态：$STATUS_TEXT\n"
+          CONTENT+="触发分支：$BRANCH\n"
+          CONTENT+="仓库：$REPO_NAME\n"
+          CONTENT+="北京时间：$BJ_TIME\n\n"
+          CONTENT+="[查看运行详情]($WORKFLOW_URL)"
+
+          CARD=$(cat <<EOF
+          {
+            "msg_type": "interactive",
+            "card": {
+              "header": {
+                "title": { "tag": "plain_text", "content": "$TITLE" },
+                "template": "$COLOR"
+              },
+              "elements": [
+                {
+                  "tag": "div",
+                  "text": { "tag": "lark_md", "content": "$CONTENT" }
+                },
+                {
+                  "tag": "action",
+                  "actions": [
+                    {
+                      "tag": "button",
+                      "text": { "tag": "plain_text", "content": "查看运行日志" },
+                      "url": "$WORKFLOW_URL",
+                      "type": "primary"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+          EOF
+          )
+
+          # 签名校验（如果配置了 secret）
+          if [ -n "$FEISHU_SECRET" ]; then
+            TIMESTAMP=$(date +%s)
+            STRING_TO_SIGN="$TIMESTAMP\n$FEISHU_SECRET"
+            SIGN=$(printf "$STRING_TO_SIGN" | openssl dgst -sha256 -hmac "$FEISHU_SECRET" -binary | base64)
+            # 带 timestamp 和 sign 的 Webhook URL
+            WEBHOOK_URL="${FEISHU_WEBHOOK}&timestamp=${TIMESTAMP}&sign=${SIGN}"
+          else
+            WEBHOOK_URL="$FEISHU_WEBHOOK"
+          fi
+
+          # 发送
+          RESPONSE=$(curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$CARD")
+
+          echo "飞书返回: $RESPONSE"
+
+          if echo "$RESPONSE" | grep -q '"code":0'; then
+            echo "飞书通知发送成功"
+          elif echo "$RESPONSE" | grep -q '"code":19021'; then
+            echo "签名校验失败，请检查 FEISHU_SECRET 配置"
+            exit 1
+          else
+            echo "飞书通知发送异常，请检查 Webhook URL"
+            exit 1
+          fi
