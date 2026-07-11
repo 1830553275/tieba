@@ -11,13 +11,14 @@ jobs:
   sync-upstream:
     runs-on: ubuntu-latest
     name: 同步上游仓库更新
+    permissions: contents: write
     
     # 仅在Fork仓库中运行此工作流
     if: github.repository != 'chiupam/tieba'
     
     steps:
       - name: 检出代码
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           # 使用默认的GITHUB_TOKEN，它对当前仓库有写权限
